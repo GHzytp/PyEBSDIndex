@@ -313,38 +313,42 @@ def index_pats_distributed(
         ngpu = 0
 
     if ncpu == 0:
-        ncpu = max(1,os.cpu_count()//2)
+        ncpu = 2
+        #ncpu = max(1,os.cpu_count()//2)
     if ncpu <= 0:
         if ngpu > 0:
-            ncpu = max(1,min(os.cpu_count(), int(len(indexer.phaseLib)*10)))
+            ncpu = max(1,min(os.cpu_count(), int(len(indexer.phaseLib)*3)))
+            #ncpu = max(1,min(os.cpu_count(), int(len(indexer.phaseLib)*16)))
             # this is a heuristic, and may be highly dependent on hardware
         else:
-            ncpu = max(1,os.cpu_count()//2)
+            ncpu = max(1,os.cpu_count()//4)
     if ncpu != -1:
         n_cpu_nodes = int(ncpu)
 
+    gpucycletimeout = 1000
     if ngpu > 0:
         gpuratio = (12, ngpu*4)
-        if (platform.machine(), platform.system()) == ('x86_64', 'Darwin'):
-            gpuratio = (6, ngpu*6)
-        ngpupro = min(max(gpuratio), 12)  # number of processes that will serve data to the gpu
-        #ngpupro = 8
-        if n_cpu_nodes < 8:
-            ngpupro = min(ngpupro, n_cpu_nodes)
-        if n_cpu_nodes < 2:
-            ngpupro = 2
-        #if OSPLATFORM == 'Linux':
-        #    ngpupro = 2
+        gpucycletimeout = 100
+        if (platform.system()) == ('Darwin'):
+            gpuratio = (12, ngpu*6)
+        #ngpupro = min(max(gpuratio), 12)  # number of processes that will serve data to the gpu
+        ngpupro = min(max(gpuratio), 12)
 
-        n_cpu_per_gpu = max(min(1.0, n_cpu_nodes-ngpu), 0.5/ngpu)
+        # if n_cpu_nodes < 8:
+        #     ngpupro = min(ngpupro, n_cpu_nodes)
+        # if n_cpu_nodes < 2:
+        #     ngpupro = 2
+
+
+        n_cpu_per_gpu = (0.5/ngpu) #max(min(1.0, n_cpu_nodes-ngpu), 0.5/ngpu)
 
         ngpuwrker = ngpupro
 
-        ngpu_per_wrker =  ngpu/ngpuwrker - 1.0e-6 # fraction of a GPU to give to each worker (band finding worker)
-        ncpugpu_per_wrker = n_cpu_per_gpu/ngpuwrker - 1.0e-6 # fraction of a cpu to allocate to each gpu worker
+        ngpu_per_wrker =  ngpu/ngpuwrker - 1.0e-3 # fraction of a GPU to give to each worker (band finding worker)
+        ncpugpu_per_wrker = n_cpu_per_gpu/ngpuwrker - 1.0e-3 # fraction of a cpu to allocate to each gpu worker
 
         # amount of cpu to allocate to each cpu worker (indexing worker)
-        ncpucpu_per_worker = (n_cpu_nodes - ncpugpu_per_wrker * ngpuwrker)/n_cpu_nodes
+        ncpucpu_per_worker = (n_cpu_nodes - ncpugpu_per_wrker * ngpuwrker)/n_cpu_nodes - 1.0e-3
 
 
         if chunksize <= 0:
@@ -354,11 +358,13 @@ def index_pats_distributed(
         usegpu = False
         ngpu_per_wrker = 0
         ngpuwrker = n_cpu_nodes
-        ncpucpu_per_worker = 0.5 - 1.0e-6
-        ncpugpu_per_wrker = 0.5 - 1.0e-6
+        ncpucpu_per_worker = 0.5 - 1.0e-3
+        ncpugpu_per_wrker = 0.5 - 1.0e-3
         if chunksize <= 0:
             chunksize = 1000
     ncpuwrker = n_cpu_nodes
+
+    PCpat = indexer._fillPCarray(PC, npats)
 
     ray.shutdown()
 
@@ -368,14 +374,17 @@ def index_pats_distributed(
     # workers do not know where to find the PyEBSDIndex module.
     cudagpuvis0 = os.getenv("CUDA_VISIBLE_DEVICES")
     os.environ["CUDA_VISIBLE_DEVICES"] = cudagpuvis
+    os.environ["RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"] ='0'
     
     rayclust = ray.init(
-        num_cpus=int(np.round(n_cpu_nodes)),
+        #num_cpus=int(np.round(n_cpu_nodes)),
+        num_cpus=min(int(np.round(os.cpu_count())), int(ncpuwrker+ngpuwrker) ),
         num_gpus=ngpu,
         _node_ip_address=RAYIPADDRESS, #"0.0.0.0",
         runtime_env={"env_vars":
                       {"PYTHONPATH": os.path.dirname(os.path.dirname(__file__)),
                        "CUDA_VISIBLE_DEVICES": cudagpuvis,
+                       "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO":'0'
                       }},
         logging_level=logging.WARNING, log_to_driver=False,
     )  # Supress INFO messages from ray.
@@ -400,6 +409,8 @@ def index_pats_distributed(
     ]
     p_indx_start_end[-1][1] = npats + patstart
     p_indx_start_end[-1][2] = p_indx_start_end[-1][1] - p_indx_start_end[-1][0]
+
+
 
     gpujobs = []
     cpujobs = []
@@ -469,7 +480,8 @@ def index_pats_distributed(
             gputask.append(
                 gpuworkers[i].findbands.remote(gjob,
                                                pats=None,
-                                               indexer=remote_indexer
+                                               indexer=remote_indexer,
+                                               PC = PCpat[gjob.pstart:gjob.pend, :]
                                                )
             )
         else:
@@ -477,14 +489,17 @@ def index_pats_distributed(
                 gpuworkers[i].findbands.remote(gjob,
                                                pats=pats[gjob.pstart:gjob.pend, :, :],
                                                indexer=remote_indexer,
+                                               PC=PCpat[gjob.pstart:gjob.pend, :]
                                                )
             )
         gtaskindex.append(gjob)
 
         #gpu_launched += 1
 
-    gpuwrker_cycles = -500
+    gpuwrker_cycles = -1000
     cpuwrker_cycles = 0
+    ngpu_retry = 0
+    ncpu_retry = 0
 
     while ncpudone < njobs:
 
@@ -541,11 +556,14 @@ def index_pats_distributed(
                         if inputmode == "filemode":
                             gputask[jid] = gpuworkers[jid].findbands.remote(gjob,
                                     pats=None,
+                                    PC=PCpat[gjob.pstart:gjob.pend, :],
                                     indexer=remote_indexer
+
                             )
                         else:
                             gputask[jid] = gpuworkers[jid].findbands.remote(gjob,
                                 pats=pats[gjob.pstart:gjob.pend, :, :],
+                                PC=PCpat[gjob.pstart:gjob.pend, :],
                                 indexer=remote_indexer,
                            )
                         gtaskindex[jid] = gjob
@@ -553,8 +571,7 @@ def index_pats_distributed(
 
 
                     else: # no more gpu tasks to submit
-                        #del gpuworkers[jid]
-                        #ray.kill(gpuworkers[jid])
+                        gpuworkers[jid].exit.remote()
                         del gpuworkers[jid]
                         del gputask[jid]
                         del gtaskindex[jid]
@@ -564,45 +581,53 @@ def index_pats_distributed(
 
 
 
-                except:
+                except Exception as e:
+                    print(e)
                     gjob = gtaskindex[jid]
-                    print('A GPU death has occured', gjob.pstart, gjob.pend)
-                    del gpuworkers[jid]
-                    del gputask[jid]
-                    del gtaskindex[jid]
-                    gpujobs.append(gjob)
-                    if len(gpuworkers) == 0:
+                    print('A GPU Process death has occurred', gjob.pstart, gjob.pend)
+                    if ngpu_retry < 5:
+                        ngpu_retry +=1
+                        del gpuworkers[jid]
+                        del gputask[jid]
+                        del gtaskindex[jid]
+                        gpujobs.append(gjob)
+                        if len(gpuworkers) == 0:
 
-                        gpuworkers.append(  # make a new Ray Actor that can call the indexer defined in shared memory.
-                            # These actors are read/write, thus can initialize the GPU queues
-                            #GPUWorker.options(num_cpus=ncpugpu_per_wrker, num_gpus=0).remote(
-                            GPUWorker.options(num_cpus=ncpugpu_per_wrker, num_gpus=ngpu_per_wrker).remote(
-                                actorid=0, clparammodule=clparamfunction, gpu_id=gpu_id, cudavis=cudagpuvis
-                            )
-                        )
-                        gjob = gpujobs.pop(0)
-                        if inputmode == "filemode":
-                            gputask.append(
-                                gpuworkers[0].findbands.remote(gjob, pats=None,
-                                   indexer=remote_indexer
+                            gpuworkers.append(  # make a new Ray Actor that can call the indexer defined in shared memory.
+                                # These actors are read/write, thus can initialize the GPU queues
+                                #GPUWorker.options(num_cpus=ncpugpu_per_wrker, num_gpus=0).remote(
+                                GPUWorker.options(num_cpus=ncpugpu_per_wrker, num_gpus=ngpu_per_wrker).remote(
+                                    actorid=0, clparammodule=clparamfunction, gpu_id=gpu_id, cudavis=cudagpuvis
                                 )
                             )
-                        else:
-                            gputask.append(
-                                gpuworkers[0].findbands.remote(gjob,
-                                   pats=pats[gjob.pstart:gjob.pend, :, :],
-                                   indexer=remote_indexer,
+                            gjob = gpujobs.pop(0)
+                            if inputmode == "filemode":
+                                gputask.append(
+                                    gpuworkers[0].findbands.remote(gjob,
+                                        pats=None,
+                                        PC=PCpat[gjob.pstart:gjob.pend, :],
+                                        indexer=remote_indexer
+                                    )
                                 )
-                            )
-                        gtaskindex.append(gjob)
+                            else:
+                                gputask.append(
+                                    gpuworkers[0].findbands.remote(gjob,
+                                       pats=pats[gjob.pstart:gjob.pend, :, :],
+                                       PC=PCpat[gjob.pstart:gjob.pend, :],
+                                       indexer=remote_indexer,
+                                    )
+                                )
+                            gtaskindex.append(gjob)
+                    else:
+                        raise e
             # toc = timer()
 
-            if gpuwrker_cycles > 100: # a gpu worker got stuck -- see if I can unstick it.
+            if gpuwrker_cycles > gpucycletimeout: # a gpu worker got stuck -- see if I can unstick it.
                 wrker = busy[0]
                 gpuwrker_cycles = 0
                 jid = gputask.index(wrker)
                 gjob = gtaskindex[jid]
-                print('A GPU death has occured. Attempting to restart.', gjob.pstart, gjob.pend)
+                print('A GPU Process death has occurred. Attempting to restart.', gjob.pstart, gjob.pend)
                 ray.kill(gpuworkers[jid])
                 del gpuworkers[jid]
                 del gputask[jid]
@@ -621,13 +646,15 @@ def index_pats_distributed(
                         gputask.append(
                             gpuworkers[0].findbands.remote(gjob,
                                                            pats=None,
-                                                           indexer=remote_indexer
+                                                           indexer=remote_indexer,
+                                                           PC = PCpat[gjob.pstart:gjob.pend, :],
                                                            )
                         )
                     else:
                         gputask.append(
                             gpuworkers[0].findbands.remote(gjob,
                                                            pats=pats[gjob.pstart:gjob.pend, :, :],
+                                                           PC=PCpat[gjob.pstart:gjob.pend, :],
                                                            indexer=remote_indexer,
                                                            )
                         )
@@ -678,6 +705,7 @@ def index_pats_distributed(
                             #cputask[jid] = None
                             #ctaskindex[jid] = None
                             #ray.kill(cpuworkers[jid])
+                            cpuworkers[jid].exit.remote()
                             del cpuworkers[jid]
                             del cputask[jid]
                             del ctaskindex[jid]
@@ -704,18 +732,22 @@ def index_pats_distributed(
                 except Exception as e:
                     print(e)
                     cjob = ctaskindex[jid]
-                    print('A CPU death has occured')
-                    ray.kill(cpuworkers[jid])
-                    del cpuworkers[jid]
-                    del cputask[jid]
-                    del ctaskindex[jid]
-                    cpujobs.append(cjob)
-                    if len(cpuworkers) == 0:
-                        cpuworkers.append(  # make a new Ray Actor that can call the indexer defined in shared memory.
-                            # These actors are read/write, thus can initialize the GPU queues
-                            CPUWorker.options(num_cpus=1, num_gpus=0).remote(0))
-                        cputask.append(cpuworkers[0].indexpoles.remote(None, None, None))
-                        ctaskindex.append(None)
+                    print('A Indexing Process death has occurred')
+                    if ncpu_retry < 5:
+                        ncpu_retry += 1
+                        ray.kill(cpuworkers[jid])
+                        del cpuworkers[jid]
+                        del cputask[jid]
+                        del ctaskindex[jid]
+                        cpujobs.append(cjob)
+                        if len(cpuworkers) == 0:
+                            cpuworkers.append(  # make a new Ray Actor that can call the indexer defined in shared memory.
+                                # These actors are read/write, thus can initialize the GPU queues
+                                CPUWorker.options(num_cpus=1, num_gpus=0).remote(0))
+                            cputask.append(cpuworkers[0].indexpoles.remote(None, None, None))
+                            ctaskindex.append(None)
+                    else:
+                        raise e
     if verbose > 0:
         print('\n...')
     ray.shutdown()
@@ -784,14 +816,15 @@ def __optimizegpuchunk__(indexer, ngpupro, gpu_id, clparam):
     twocheck = np.log2(float(chunk))
     if np.abs((twocheck) - np.round(twocheck)) < 0.2:
         chunk = int(2**int(np.round(twocheck)))
-        if OSPLATFORM == 'Darwin': # I don't know why, but AMD/Intel macOS does not like powers of two.
-            chunk = max(48, chunk-16)
+        #if OSPLATFORM == 'Darwin': # I don't know why, but AMD/Intel macOS does not like powers of two.
+        #    chunk = max(48, chunk-16)
 
-    # finally - I am unsure how to check for integrated graphics that report system memory, so I am going
-    # throw an arbitrary cap on this:
-    chunk = min(2032, chunk)
+    if clparam.gpusharedmem == True: # The GPU is an integrated GPU, so memory reporting might be strange.
+        # Put a hard cap on number of patterns to process.
+        chunk = min(2048*2, chunk)
 
     return chunk
+
 
 
 @ray.remote(num_cpus=1, num_gpus=1)
@@ -884,6 +917,9 @@ class GPUWorker:
                  }
         return stats
 
+    def exit(self):
+        ray.actor.exit_actor()
+
 
 
 
@@ -909,6 +945,8 @@ class CPUWorker:
             print(e)
             cpujob.rate = None
             return "Error", (None,None, cpujob)
+    def exit(self):
+        ray.actor.exit_actor()
 
 
 class CPUGPUJob:
@@ -927,4 +965,5 @@ class CPUGPUJob:
         self.endtime = timer()
         self.extime += self.endtime - self.starttime
         self.rate = self.npat/(self.extime + 1e-12)
+
 
